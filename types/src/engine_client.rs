@@ -26,8 +26,6 @@ use tracing::{error, warn};
 
 use crate::Block;
 use alloy_transport_ipc::IpcConnect;
-use commonware_cryptography::Signer;
-use commonware_cryptography::bls12381::primitives::variant::Variant;
 use std::future::Future;
 
 pub trait EngineClient: Clone + Send + Sync + 'static {
@@ -44,10 +42,7 @@ pub trait EngineClient: Clone + Send + Sync + 'static {
         payload_id: PayloadId,
     ) -> impl Future<Output = ExecutionPayloadEnvelopeV4> + Send;
 
-    fn check_payload<C: Signer, V: Variant>(
-        &mut self,
-        block: &Block<C, V>,
-    ) -> impl Future<Output = PayloadStatus> + Send;
+    fn check_payload(&mut self, block: &Block) -> impl Future<Output = PayloadStatus> + Send;
 
     fn commit_hash(
         &mut self,
@@ -147,7 +142,7 @@ impl EngineClient for RethEngineClient {
         }
     }
 
-    async fn check_payload<C: Signer, V: Variant>(&mut self, block: &Block<C, V>) -> PayloadStatus {
+    async fn check_payload(&mut self, block: &Block) -> PayloadStatus {
         match self
             .provider
             .new_payload_v4(
@@ -208,8 +203,6 @@ pub mod base_benchmarking {
         ForkchoiceState, PayloadId, PayloadStatus,
     };
     use alloy_transport_ipc::IpcConnect;
-    use commonware_cryptography::Signer;
-    use commonware_cryptography::bls12381::primitives::variant::Variant;
     use op_alloy_network::Optimism;
     use serde::{Deserialize, Serialize};
     use std::fs;
@@ -293,10 +286,7 @@ pub mod base_benchmarking {
             }
         }
 
-        async fn check_payload<C: Signer, V: Variant>(
-            &mut self,
-            block: &Block<C, V>,
-        ) -> PayloadStatus {
+        async fn check_payload(&mut self, block: &Block) -> PayloadStatus {
             let timestamp = block.payload.payload_inner.payload_inner.timestamp;
             let canyon_activation = 1704992401u64; // January 11, 2024 - Canyon activation on Base
 
@@ -411,8 +401,6 @@ pub mod benchmarking {
         ForkchoiceState, PayloadId, PayloadStatus,
     };
     use alloy_transport_ipc::IpcConnect;
-    use commonware_cryptography::Signer;
-    use commonware_cryptography::bls12381::primitives::variant::Variant;
     use serde::{Deserialize, Serialize};
     use std::fs;
     use std::path::PathBuf;
@@ -473,10 +461,7 @@ pub mod benchmarking {
             }
         }
 
-        async fn check_payload<C: Signer, V: Variant>(
-            &mut self,
-            block: &Block<C, V>,
-        ) -> PayloadStatus {
+        async fn check_payload(&mut self, block: &Block) -> PayloadStatus {
             // For Ethereum, use standard engine_newPayloadV4 without Optimism-specific logic
             self.provider
                 .new_payload_v4(
