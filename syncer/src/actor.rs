@@ -272,6 +272,7 @@ where
     }
 
     /// Start the actor.
+    #[allow(clippy::too_many_arguments)] // todo this can probably be trimmed down
     pub fn start<R, K>(
         mut self,
         application: impl Reporter<Activity = Update<B, P::Scheme, A>>,
@@ -280,6 +281,7 @@ where
         sync_height: u64,
         sync_epoch: u64,
         sync_view: u64,
+        checkpoint_last_block: Option<B>,
     ) -> Handle<()>
     where
         R: Resolver<
@@ -296,12 +298,14 @@ where
                 resolver,
                 sync_height,
                 sync_epoch,
-                sync_view
+                sync_view,
+                checkpoint_last_block
             )
             .await
         )
     }
 
+    #[allow(clippy::too_many_arguments)] // todo this can probably be trimmed down
     /// Run the application actor.
     async fn run<R, K>(
         mut self,
@@ -311,6 +315,7 @@ where
         sync_height: u64,
         sync_epoch: u64,
         sync_view: u64,
+        checkpoint_last_block: Option<B>,
     ) where
         R: Resolver<
                 Key = handler::Request<B>,
@@ -321,6 +326,21 @@ where
         self.last_processed_height = sync_height;
         self.last_processed_round = Round::new(Epoch::new(sync_epoch), View::new(sync_view));
         self.tip = sync_height;
+
+        // If we have a checkpoint last block meaning we loaded from checkpoint, finalize it to complete the checkpoint
+        if let Some(last_block) = checkpoint_last_block {
+            let height = last_block.height().get();
+            self.finalize(
+                height,
+                last_block.commitment(),
+                last_block,
+                None,
+                &mut application,
+                &mut buffer,
+                &mut resolver,
+            )
+            .await;
+        }
 
         #[cfg(feature = "prom")]
         {
