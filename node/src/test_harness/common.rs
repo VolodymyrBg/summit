@@ -1,7 +1,7 @@
 use commonware_cryptography::{Hasher, Sha256, Signer, bls12381};
 use commonware_math::algebra::Random;
 
-use crate::engine::{PROTOCOL_VERSION, VALIDATOR_MINIMUM_STAKE};
+use crate::engine::PROTOCOL_VERSION;
 use crate::test_harness::mock_engine_client::MockEngineNetwork;
 use crate::{config::EngineConfig, engine::Engine};
 use alloy_eips::eip7685::Requests;
@@ -26,7 +26,9 @@ use std::{
 };
 use summit_types::account::{ValidatorAccount, ValidatorStatus};
 use summit_types::consensus_state::ConsensusState;
-use summit_types::execution_request::{DepositRequest, ExecutionRequest, WithdrawalRequest};
+use summit_types::execution_request::{
+    DepositRequest, ExecutionRequest, ProtocolParamRequest, WithdrawalRequest,
+};
 use summit_types::keystore::KeyStore;
 use summit_types::network_oracle::NetworkOracle;
 use summit_types::{Digest, EngineClient, PrivateKey, PublicKey};
@@ -178,13 +180,8 @@ pub fn run_until_height(
             .try_into()
             .expect("failed to convert genesis hash");
         let engine_client_network = MockEngineNetwork::new(genesis_hash);
-        let initial_state = get_initial_state(
-            genesis_hash,
-            &validators,
-            None,
-            None,
-            VALIDATOR_MINIMUM_STAKE,
-        );
+        let initial_state =
+            get_initial_state(genesis_hash, &validators, None, None, 32_000_000_000);
 
         // Create instances
         let mut public_keys = HashSet::new();
@@ -299,7 +296,7 @@ pub fn get_initial_state(
             safe_block_hash: genesis_hash,
             finalized_block_hash: genesis_hash,
         };
-        let mut state = ConsensusState::new(forkchoice);
+        let mut state = ConsensusState::new(forkchoice, balance, balance);
         // Add the genesis nodes to the consensus state with the minimum stake balance.
         for ((node_pubkey, consensus_pubkey), address) in committee.iter().zip(addresses.iter()) {
             let pubkey_bytes: [u8; 32] = node_pubkey
@@ -478,6 +475,30 @@ pub fn create_withdrawal_request(
         source_address,
         validator_pubkey,
         amount,
+    }
+}
+
+/// Create a ProtocolParamRequest for testing
+///
+/// # Arguments
+/// * `param_id` - The protocol parameter ID (0x00 for MinimumStake, 0x01 for MaximumStake)
+/// * `value` - The parameter value as u64
+///
+/// # Returns
+/// * `ProtocolParamRequest` - A protocol parameter request with the specified data
+///
+/// # Examples
+/// ```
+/// // Create a minimum stake parameter request
+/// let min_stake_request = create_protocol_param_request(0x00, 40_000_000_000);
+///
+/// // Create a maximum stake parameter request
+/// let max_stake_request = create_protocol_param_request(0x01, 64_000_000_000);
+/// ```
+pub fn create_protocol_param_request(param_id: u8, value: u64) -> ProtocolParamRequest {
+    ProtocolParamRequest {
+        param_id,
+        param: value.to_le_bytes().to_vec(),
     }
 }
 

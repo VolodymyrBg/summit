@@ -1,6 +1,7 @@
 use crate::account::{ValidatorAccount, ValidatorStatus};
 use crate::checkpoint::Checkpoint;
 use crate::execution_request::{DepositRequest, WithdrawalRequest};
+use crate::protocol_params::ProtocolParam;
 use crate::withdrawal::PendingWithdrawal;
 use crate::{Digest, PublicKey};
 use alloy_eips::eip4895::Withdrawal;
@@ -18,13 +19,16 @@ pub struct ConsensusState {
     pub head_digest: Digest,
     pub next_withdrawal_index: u64,
     pub deposit_queue: VecDeque<DepositRequest>,
-    pub withdrawal_queue: VecDeque<PendingWithdrawal>,
+    pub withdrawal_queue: BTreeMap<u64, VecDeque<PendingWithdrawal>>, // epoch -> withdrawals
     pub validator_accounts: BTreeMap<[u8; 32], ValidatorAccount>,
+    pub protocol_param_changes: Vec<ProtocolParam>,
     pub pending_checkpoint: Option<Checkpoint>,
     pub added_validators: BTreeMap<u64, Vec<PublicKey>>,
     pub removed_validators: Vec<PublicKey>,
     pub forkchoice: ForkchoiceState,
     pub epoch_genesis_hash: [u8; 32],
+    pub validator_minimum_stake: u64, // in gwei
+    pub validator_maximum_stake: u64, // in gwei
 }
 
 impl Default for ConsensusState {
@@ -37,22 +41,31 @@ impl Default for ConsensusState {
             next_withdrawal_index: 0,
             deposit_queue: Default::default(),
             withdrawal_queue: Default::default(),
+            protocol_param_changes: Default::default(),
             validator_accounts: Default::default(),
             pending_checkpoint: None,
             added_validators: Default::default(),
             removed_validators: Vec::new(),
             forkchoice: Default::default(),
             epoch_genesis_hash: [0u8; 32],
+            validator_minimum_stake: 32_000_000_000, // 32 ETH in gwei
+            validator_maximum_stake: 32_000_000_000, // 32 ETH in gwei
         }
     }
 }
 
 impl ConsensusState {
-    pub fn new(forkchoice: ForkchoiceState) -> Self {
+    pub fn new(
+        forkchoice: ForkchoiceState,
+        validator_minimum_stake: u64,
+        validator_maximum_stake: u64,
+    ) -> Self {
         Self {
             forkchoice,
             epoch_genesis_hash: forkchoice.head_block_hash.into(),
             head_digest: (*forkchoice.head_block_hash).into(),
+            validator_minimum_stake,
+            validator_maximum_stake,
             ..Default::default()
         }
     }
@@ -90,8 +103,12 @@ impl ConsensusState {
         self.head_digest
     }
 
-    pub fn set_next_withdrawal_index(&mut self, index: u64) {
-        self.next_withdrawal_index = index;
+    pub fn get_minimum_stake(&self) -> u64 {
+        self.validator_minimum_stake
+    }
+
+    pub fn get_maximum_stake(&self) -> u64 {
+        self.validator_maximum_stake
     }
 
     fn get_and_increment_withdrawal_index(&mut self) -> u64 {
@@ -102,6 +119,10 @@ impl ConsensusState {
 
     pub fn get_pending_checkpoint(&self) -> Option<&Checkpoint> {
         self.pending_checkpoint.as_ref()
+    }
+
+    pub fn set_next_withdrawal_index(&mut self, index: u64) {
+        self.next_withdrawal_index = index;
     }
 
     pub fn set_pending_checkpoint(&mut self, checkpoint: Option<Checkpoint>) {
@@ -170,7 +191,7 @@ impl ConsensusState {
     }
 
     // Withdrawal queue operations
-    pub fn push_withdrawal_request(&mut self, request: WithdrawalRequest, withdrawal_height: u64) {
+    pub fn push_withdrawal_request(&mut self, request: WithdrawalRequest, withdrawal_epoch: u64) {
         let withdrawal_index = self.get_and_increment_withdrawal_index();
 
         let pending_withdrawal = PendingWithdrawal {
@@ -180,37 +201,54 @@ impl ConsensusState {
                 address: request.source_address,
                 amount: request.amount,
             },
-            withdrawal_height,
             pubkey: request.validator_pubkey,
         };
 
-        self.push_withdrawal(pending_withdrawal);
+        self.push_withdrawal(pending_withdrawal, withdrawal_epoch);
     }
 
-    pub fn push_withdrawal(&mut self, request: PendingWithdrawal) {
-        self.withdrawal_queue.push_back(request);
-    }
-
-    pub fn peek_withdrawal(&self) -> Option<&PendingWithdrawal> {
-        self.withdrawal_queue.front()
-    }
-
-    pub fn pop_withdrawal(&mut self) -> Option<PendingWithdrawal> {
-        self.withdrawal_queue.pop_front()
-    }
-
-    /// Get the next K pending withdrawals that are ready for processing at the given block height.
-    /// Only returns withdrawals where withdrawal_height <= block_height.
-    pub fn get_next_ready_withdrawals(&self, block_height: u64, k: usize) -> Vec<PendingWithdrawal>
-    where
-        PendingWithdrawal: Clone,
-    {
+    pub fn push_withdrawal(&mut self, request: PendingWithdrawal, withdrawal_epoch: u64) {
         self.withdrawal_queue
-            .iter()
-            .filter(|withdrawal| withdrawal.withdrawal_height <= block_height)
-            .take(k)
-            .cloned()
-            .collect()
+            .entry(withdrawal_epoch)
+            .or_default()
+            .push_back(request);
+    }
+
+    pub fn peek_withdrawal(&self, withdrawal_epoch: u64) -> Option<&PendingWithdrawal> {
+        self.withdrawal_queue
+            .get(&withdrawal_epoch)
+            .and_then(|queue| queue.front())
+    }
+
+    pub fn pop_withdrawal(&mut self, withdrawal_epoch: u64) -> Option<PendingWithdrawal> {
+        if let Some(queue) = self.withdrawal_queue.get_mut(&withdrawal_epoch) {
+            let withdrawal = queue.pop_front();
+            // Remove the epoch entry if the queue is now empty
+            if queue.is_empty() {
+                self.withdrawal_queue.remove(&withdrawal_epoch);
+            }
+            withdrawal
+        } else {
+            None
+        }
+    }
+
+    /// Get all pending withdrawals for a specific epoch
+    pub fn get_withdrawals_for_epoch(&self, epoch: u64) -> Option<&VecDeque<PendingWithdrawal>> {
+        self.withdrawal_queue.get(&epoch)
+    }
+
+    /// Get the number of pending withdrawals for a specific epoch
+    pub fn get_withdrawal_count_for_epoch(&self, epoch: u64) -> usize {
+        self.withdrawal_queue
+            .get(&epoch)
+            .map(|queue| queue.len())
+            .unwrap_or(0)
+    }
+
+    /// Get all epochs that have pending withdrawals
+    pub fn get_epochs_with_withdrawals(&self) -> Vec<u64> {
+        self.withdrawal_queue.keys().copied().collect()
     }
 
     pub fn get_validator_keys(&self) -> Vec<(PublicKey, bls12381::PublicKey)> {
@@ -275,6 +313,31 @@ impl ConsensusState {
             .map(|(pk, bls_pk)| (pk, bls_pk.into()))
             .collect()
     }
+
+    pub fn apply_protocol_parameter_changes(&mut self) -> bool {
+        let mut min_or_max_stake_changed = false;
+        while let Some(param) = self.protocol_param_changes.pop() {
+            match param {
+                ProtocolParam::MinimumStake(min_stake) => {
+                    self.validator_minimum_stake = min_stake;
+                    min_or_max_stake_changed = true;
+                }
+                ProtocolParam::MaximumStake(max_stake) => {
+                    self.validator_maximum_stake = max_stake;
+                    min_or_max_stake_changed = true;
+                }
+            }
+        }
+        min_or_max_stake_changed
+    }
+
+    pub fn validator_is_joining(&self, node_pubkey: &PublicKey) -> bool {
+        let validator_pubkey: [u8; 32] = node_pubkey.as_ref().try_into().unwrap();
+        self.validator_accounts
+            .get(&validator_pubkey)
+            .map(|acc| acc.status == ValidatorStatus::Joining)
+            .unwrap_or(false)
+    }
 }
 
 impl EncodeSize for ConsensusState {
@@ -285,8 +348,14 @@ impl EncodeSize for ConsensusState {
         + 8 // next_withdrawal_index
         + 4 // deposit_queue length
         + self.deposit_queue.iter().map(|req| req.encode_size()).sum::<usize>()
-        + 4 // withdrawal_queue length
-        + self.withdrawal_queue.iter().map(|req| req.encode_size()).sum::<usize>()
+        + 4 // withdrawal_queue epoch count
+        + self.withdrawal_queue.values().map(|queue| {
+            8 // epoch (u64)
+            + 4 // queue length (u32)
+            + queue.iter().map(|req| req.encode_size()).sum::<usize>()
+        }).sum::<usize>()
+        + 4 // protocol_param_changes length
+        + self.protocol_param_changes.iter().map(|param| param.encode_size()).sum::<usize>()
         + 4 // validator_accounts length
         + self.validator_accounts.iter().map(|(key, account)| key.len() + account.encode_size()).sum::<usize>()
         + 1 // pending_checkpoint presence flag
@@ -300,6 +369,8 @@ impl EncodeSize for ConsensusState {
         + 32 // forkchoice.finalized_block_hash
         + 32 // epoch_genesis_hash
         + 32 // head_digest
+        + 8 // validator_minimum_stake
+        + 8 // validator_maximum_stake
     }
 }
 
@@ -318,10 +389,22 @@ impl Read for ConsensusState {
             deposit_queue.push_back(DepositRequest::read_cfg(buf, &())?);
         }
 
-        let withdrawal_queue_len = buf.get_u32() as usize;
-        let mut withdrawal_queue = VecDeque::with_capacity(withdrawal_queue_len);
-        for _ in 0..withdrawal_queue_len {
-            withdrawal_queue.push_back(PendingWithdrawal::read_cfg(buf, &())?);
+        let withdrawal_queue_epoch_count = buf.get_u32() as usize;
+        let mut withdrawal_queue = BTreeMap::new();
+        for _ in 0..withdrawal_queue_epoch_count {
+            let epoch = buf.get_u64();
+            let queue_len = buf.get_u32() as usize;
+            let mut queue = VecDeque::with_capacity(queue_len);
+            for _ in 0..queue_len {
+                queue.push_back(PendingWithdrawal::read_cfg(buf, &())?);
+            }
+            withdrawal_queue.insert(epoch, queue);
+        }
+
+        let protocol_param_changes_len = buf.get_u32() as usize;
+        let mut protocol_param_changes = Vec::with_capacity(protocol_param_changes_len);
+        for _ in 0..protocol_param_changes_len {
+            protocol_param_changes.push(crate::protocol_params::ProtocolParam::read_cfg(buf, &())?);
         }
 
         let validator_accounts_len = buf.get_u32() as usize;
@@ -382,6 +465,9 @@ impl Read for ConsensusState {
         buf.copy_to_slice(&mut head_digest_bytes);
         let head_digest = sha256::Digest(head_digest_bytes);
 
+        let validator_minimum_stake = buf.get_u64();
+        let validator_maximum_stake = buf.get_u64();
+
         Ok(Self {
             epoch,
             view,
@@ -390,12 +476,15 @@ impl Read for ConsensusState {
             next_withdrawal_index,
             deposit_queue,
             withdrawal_queue,
+            protocol_param_changes,
             validator_accounts,
             pending_checkpoint,
             added_validators,
             removed_validators,
             forkchoice,
             epoch_genesis_hash,
+            validator_minimum_stake,
+            validator_maximum_stake,
         })
     }
 }
@@ -413,8 +502,17 @@ impl Write for ConsensusState {
         }
 
         buf.put_u32(self.withdrawal_queue.len() as u32);
-        for request in &self.withdrawal_queue {
-            request.write(buf);
+        for (epoch, queue) in &self.withdrawal_queue {
+            buf.put_u64(*epoch);
+            buf.put_u32(queue.len() as u32);
+            for request in queue {
+                request.write(buf);
+            }
+        }
+
+        buf.put_u32(self.protocol_param_changes.len() as u32);
+        for param in &self.protocol_param_changes {
+            param.write(buf);
         }
 
         buf.put_u32(self.validator_accounts.len() as u32);
@@ -457,6 +555,10 @@ impl Write for ConsensusState {
 
         // Write head_digest
         buf.put_slice(&self.head_digest.0);
+
+        // Write validator stake bounds
+        buf.put_u64(self.validator_minimum_stake);
+        buf.put_u64(self.validator_maximum_stake);
     }
 }
 
@@ -500,11 +602,7 @@ mod tests {
         }
     }
 
-    fn create_test_withdrawal(
-        index: u64,
-        amount: u64,
-        withdrawal_height: u64,
-    ) -> PendingWithdrawal {
+    fn create_test_withdrawal(index: u64, amount: u64) -> PendingWithdrawal {
         PendingWithdrawal {
             inner: Withdrawal {
                 index,
@@ -512,7 +610,6 @@ mod tests {
                 address: Address::from([index as u8; 20]),
                 amount,
             },
-            withdrawal_height,
             pubkey: [index as u8; 32],
         }
     }
@@ -578,10 +675,18 @@ mod tests {
         original_state.push_deposit(deposit1);
         original_state.push_deposit(deposit2);
 
-        let withdrawal1 = create_test_withdrawal(1, 16000000000, 100);
-        let withdrawal2 = create_test_withdrawal(2, 24000000000, 150);
-        original_state.push_withdrawal(withdrawal1);
-        original_state.push_withdrawal(withdrawal2);
+        let withdrawal1 = create_test_withdrawal(1, 16000000000);
+        let withdrawal2 = create_test_withdrawal(2, 24000000000);
+        original_state.push_withdrawal(withdrawal1, 10); // epoch 10
+        original_state.push_withdrawal(withdrawal2, 11); // epoch 11
+
+        // Add protocol param changes
+        original_state.protocol_param_changes.push(
+            crate::protocol_params::ProtocolParam::MinimumStake(40_000_000_000),
+        );
+        original_state.protocol_param_changes.push(
+            crate::protocol_params::ProtocolParam::MaximumStake(80_000_000_000),
+        );
 
         let pubkey1 = [1u8; 32];
         let pubkey2 = [2u8; 32];
@@ -625,13 +730,35 @@ mod tests {
         assert_eq!(decoded_state.deposit_queue[0].amount, 32000000000);
         assert_eq!(decoded_state.deposit_queue[1].amount, 16000000000);
 
+        // Check withdrawal_queue - should have 2 epochs with withdrawals
         assert_eq!(decoded_state.withdrawal_queue.len(), 2);
-        assert_eq!(decoded_state.withdrawal_queue[0].inner.index, 1);
-        assert_eq!(decoded_state.withdrawal_queue[0].inner.amount, 16000000000);
-        assert_eq!(decoded_state.withdrawal_queue[0].withdrawal_height, 100);
-        assert_eq!(decoded_state.withdrawal_queue[1].inner.index, 2);
-        assert_eq!(decoded_state.withdrawal_queue[1].inner.amount, 24000000000);
-        assert_eq!(decoded_state.withdrawal_queue[1].withdrawal_height, 150);
+
+        // Check epoch 10 withdrawal
+        let epoch10_withdrawals = decoded_state.get_withdrawals_for_epoch(10).unwrap();
+        assert_eq!(epoch10_withdrawals.len(), 1);
+        assert_eq!(epoch10_withdrawals[0].inner.index, 1);
+        assert_eq!(epoch10_withdrawals[0].inner.amount, 16000000000);
+
+        // Check epoch 11 withdrawal
+        let epoch11_withdrawals = decoded_state.get_withdrawals_for_epoch(11).unwrap();
+        assert_eq!(epoch11_withdrawals.len(), 1);
+        assert_eq!(epoch11_withdrawals[0].inner.index, 2);
+        assert_eq!(epoch11_withdrawals[0].inner.amount, 24000000000);
+
+        // Verify protocol_param_changes
+        assert_eq!(decoded_state.protocol_param_changes.len(), 2);
+        match &decoded_state.protocol_param_changes[0] {
+            crate::protocol_params::ProtocolParam::MinimumStake(value) => {
+                assert_eq!(*value, 40_000_000_000)
+            }
+            _ => panic!("Expected MinimumStake variant"),
+        }
+        match &decoded_state.protocol_param_changes[1] {
+            crate::protocol_params::ProtocolParam::MaximumStake(value) => {
+                assert_eq!(*value, 80_000_000_000)
+            }
+            _ => panic!("Expected MaximumStake variant"),
+        }
 
         assert_eq!(decoded_state.validator_accounts.len(), 2);
         let decoded_account1 = decoded_state.validator_accounts.get(&pubkey1).unwrap();
@@ -672,8 +799,20 @@ mod tests {
         let deposit = create_test_deposit_request(1, 32000000000);
         state.push_deposit(deposit);
 
-        let withdrawal = create_test_withdrawal(1, 16000000000, 100);
-        state.push_withdrawal(withdrawal);
+        let withdrawal = create_test_withdrawal(1, 16000000000);
+        state.push_withdrawal(withdrawal, 5); // epoch 5
+
+        // Add protocol param changes
+        state
+            .protocol_param_changes
+            .push(crate::protocol_params::ProtocolParam::MinimumStake(
+                50_000_000_000,
+            ));
+        state
+            .protocol_param_changes
+            .push(crate::protocol_params::ProtocolParam::MaximumStake(
+                100_000_000_000,
+            ));
 
         let pubkey = [1u8; 32];
         let account = create_test_validator_account(1, 32000000000);
@@ -692,6 +831,63 @@ mod tests {
         let actual_encoded = state.encode();
         let actual_size = actual_encoded.len();
 
+        assert_eq!(predicted_size, actual_size);
+    }
+
+    #[test]
+    fn test_protocol_param_changes_serialization() {
+        let mut state = ConsensusState::default();
+
+        // Add various protocol param changes
+        state
+            .protocol_param_changes
+            .push(crate::protocol_params::ProtocolParam::MinimumStake(
+                32_000_000_000,
+            ));
+        state
+            .protocol_param_changes
+            .push(crate::protocol_params::ProtocolParam::MaximumStake(
+                64_000_000_000,
+            ));
+        state
+            .protocol_param_changes
+            .push(crate::protocol_params::ProtocolParam::MinimumStake(
+                40_000_000_000,
+            ));
+
+        let mut encoded = state.encode();
+        let decoded_state = ConsensusState::decode(&mut encoded).expect("Failed to decode");
+
+        assert_eq!(
+            decoded_state.protocol_param_changes.len(),
+            state.protocol_param_changes.len()
+        );
+        assert_eq!(decoded_state.protocol_param_changes.len(), 3);
+
+        match &decoded_state.protocol_param_changes[0] {
+            crate::protocol_params::ProtocolParam::MinimumStake(value) => {
+                assert_eq!(*value, 32_000_000_000)
+            }
+            _ => panic!("Expected MinimumStake variant"),
+        }
+
+        match &decoded_state.protocol_param_changes[1] {
+            crate::protocol_params::ProtocolParam::MaximumStake(value) => {
+                assert_eq!(*value, 64_000_000_000)
+            }
+            _ => panic!("Expected MaximumStake variant"),
+        }
+
+        match &decoded_state.protocol_param_changes[2] {
+            crate::protocol_params::ProtocolParam::MinimumStake(value) => {
+                assert_eq!(*value, 40_000_000_000)
+            }
+            _ => panic!("Expected MinimumStake variant"),
+        }
+
+        // Verify encode_size is correct
+        let predicted_size = state.encode_size();
+        let actual_size = state.encode().len();
         assert_eq!(predicted_size, actual_size);
     }
 
@@ -737,8 +933,8 @@ mod tests {
         let deposit = create_test_deposit_request(1, 32000000000);
         original_state.push_deposit(deposit);
 
-        let withdrawal = create_test_withdrawal(1, 16000000000, 50);
-        original_state.push_withdrawal(withdrawal);
+        let withdrawal = create_test_withdrawal(1, 16000000000);
+        original_state.push_withdrawal(withdrawal, 7); // epoch 7
 
         let pubkey = [1u8; 32];
         let account = create_test_validator_account(1, 32000000000);
@@ -779,8 +975,8 @@ mod tests {
 
         // Check specific values
         assert_eq!(restored_state.deposit_queue[0].amount, 32000000000);
-        assert_eq!(restored_state.withdrawal_queue[0].inner.amount, 16000000000);
-        assert_eq!(restored_state.withdrawal_queue[0].withdrawal_height, 50);
+        let epoch7_withdrawals = restored_state.get_withdrawals_for_epoch(7).unwrap();
+        assert_eq!(epoch7_withdrawals[0].inner.amount, 16000000000);
 
         let restored_account = restored_state.get_account(&pubkey).unwrap();
         assert_eq!(restored_account.balance, 32000000000);

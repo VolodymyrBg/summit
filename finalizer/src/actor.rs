@@ -1,7 +1,7 @@
-use crate::archive::backup_with_enclave;
 use crate::db::{Config as StateConfig, FinalizerState};
 use crate::{FinalizerConfig, FinalizerMailbox, FinalizerMessage};
 use alloy_eips::eip4895::Withdrawal;
+use alloy_primitives::Address;
 use alloy_rpc_types_engine::ForkchoiceState;
 #[allow(unused)]
 use commonware_codec::{DecodeExt as _, ReadExt as _};
@@ -33,14 +33,16 @@ use summit_types::checkpoint::Checkpoint;
 use summit_types::consensus_state_query::{ConsensusStateRequest, ConsensusStateResponse};
 use summit_types::execution_request::{DepositRequest, ExecutionRequest, WithdrawalRequest};
 use summit_types::network_oracle::NetworkOracle;
+use summit_types::protocol_params::ProtocolParam;
 use summit_types::scheme::EpochTransition;
 use summit_types::utils::{
-    is_last_block_of_epoch, is_penultimate_block_of_epoch, parse_withdrawal_credentials,
+    is_first_block_of_epoch, is_last_block_of_epoch, is_penultimate_block_of_epoch,
+    parse_withdrawal_credentials,
 };
 use summit_types::{Block, BlockAuxData, Digest, FinalizedHeader, PublicKey, Signature};
 use summit_types::{EngineClient, consensus_state::ConsensusState};
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, info, warn};
 
 const WRITE_BUFFER: NonZero<usize> = NZUsize!(1024 * 1024);
 
@@ -58,7 +60,6 @@ pub struct Finalizer<
     S: Signer<PublicKey = PublicKey>,
     V: Variant,
 > {
-    archive_mode: bool,
     mailbox: mpsc::Receiver<FinalizerMessage<bls12381_multisig::Scheme<PublicKey, V>, Block>>,
     pending_height_notifys: BTreeMap<(u64, Digest), Vec<oneshot::Sender<bool>>>,
     context: ContextCell<R>,
@@ -75,10 +76,8 @@ pub struct Finalizer<
     orphaned_blocks: BTreeMap<u64, HashMap<Digest, Vec<Block>>>,
 
     genesis_hash: [u8; 32],
-    validator_max_withdrawals_per_block: usize,
     epoch_num_of_blocks: u64,
     protocol_version_digest: Digest,
-    validator_minimum_stake: u64,         // in gwei
     validator_withdrawal_num_epochs: u64, // in epochs
     validator_onboarding_limit_per_block: usize,
     validator_num_warm_up_epochs: u64,
@@ -140,7 +139,6 @@ impl<
 
         (
             Self {
-                archive_mode: cfg.archive_mode,
                 context: ContextCell::new(context),
                 mailbox: rx,
                 engine_client: cfg.engine_client,
@@ -152,10 +150,8 @@ impl<
                 canonical_state: state.clone(),
                 fork_states: BTreeMap::new(),
                 orphaned_blocks: BTreeMap::new(),
-                validator_max_withdrawals_per_block: cfg.validator_max_withdrawals_per_block,
                 genesis_hash: cfg.genesis_hash,
                 protocol_version_digest: Sha256::hash(&cfg.protocol_version.to_le_bytes()),
-                validator_minimum_stake: cfg.validator_minimum_stake,
                 validator_withdrawal_num_epochs: cfg.validator_withdrawal_num_epochs,
                 validator_onboarding_limit_per_block: cfg.validator_onboarding_limit_per_block,
                 validator_num_warm_up_epochs: cfg.validator_num_warm_up_epochs,
@@ -198,7 +194,12 @@ impl<
             .await;
 
         loop {
-            if self.validator_exit {
+            if self.validator_exit
+                && is_first_block_of_epoch(
+                    self.epoch_num_of_blocks,
+                    self.canonical_state.get_latest_height(),
+                )
+            {
                 // If the validator was removed from the committee, trigger coordinated shutdown
                 info!("Validator no longer on the committee, shutting down");
                 self.cancellation_token.cancel();
@@ -333,9 +334,7 @@ impl<
                 &block,
                 &mut self.canonical_state,
                 self.epoch_num_of_blocks,
-                self.validator_max_withdrawals_per_block,
                 self.protocol_version_digest,
-                self.validator_minimum_stake,
                 self.validator_onboarding_limit_per_block,
                 self.validator_num_warm_up_epochs,
                 self.validator_withdrawal_num_epochs,
@@ -427,63 +426,11 @@ impl<
                 }
             }
 
-            // Add and remove validators for the next epoch
-            let next_epoch = self.canonical_state.epoch + 1;
-            if self
-                .canonical_state
-                .added_validators
-                .contains_key(&next_epoch)
-                || !self.canonical_state.removed_validators.is_empty()
-            {
-                // Activate validators for the coming epoch.
-                if let Some(added_validators) =
-                    self.canonical_state.added_validators.get(&next_epoch)
-                {
-                    for key in added_validators {
-                        let key_bytes: [u8; 32] = key.as_ref().try_into().unwrap();
-                        let account = self
-                            .canonical_state
-                            .validator_accounts
-                            .get_mut(&key_bytes)
-                            .expect(
-                                "only validators with accounts are added to the added_validators queue",
-                            );
-                        account.status = ValidatorStatus::Active;
-                    }
-                }
+            // Apply protocol parameter changes
+            let stake_changed = self.canonical_state.apply_protocol_parameter_changes();
 
-                for key in self.canonical_state.removed_validators.iter() {
-                    // TODO(matthias): I think this is not necessary. Inactive accounts will be removed after withdrawing.
-                    let key_bytes: [u8; 32] = key.as_ref().try_into().unwrap();
-                    if let Some(account) =
-                        self.canonical_state.validator_accounts.get_mut(&key_bytes)
-                    {
-                        account.status = ValidatorStatus::Inactive;
-                    }
-                }
-
-                // If the node's public key is contained in the removed validator list,
-                // trigger an exit
-                if self
-                    .canonical_state
-                    .removed_validators
-                    .iter()
-                    .any(|pk| pk == &self.node_public_key)
-                {
-                    self.validator_exit = true;
-                }
-            }
-
-            if self.archive_mode {
-                // Should always be there
-                if let Some(checkpoint) = &self.canonical_state.pending_checkpoint
-                    && let Err(e) =
-                        backup_with_enclave(self.canonical_state.epoch, checkpoint.clone())
-                {
-                    // This shouldn't be critical but it should be logged
-                    error!("Unable to backup with enclave: {}", e);
-                }
-            }
+            // Build the committee for the next epoch.
+            self.update_validator_committee(stake_changed);
 
             #[cfg(feature = "prom")]
             let db_operations_start = Instant::now();
@@ -518,6 +465,14 @@ impl<
                 histogram!("database_operations_duration_millis").record(db_operations_duration);
             }
 
+            // Clear the added and removed validators
+            self.canonical_state
+                .added_validators
+                .remove(&self.canonical_state.epoch);
+            if !self.canonical_state.removed_validators.is_empty() {
+                self.canonical_state.removed_validators.clear();
+            }
+
             // Create the list of validators for the p2p network for the next epoch.
             // We also include the validators that already staked and are waiting to join the committee.
             let active_validators = self.canonical_state.get_active_or_joining_validators();
@@ -532,6 +487,19 @@ impl<
             // Send the new validator list to the orchestrator amd start the Simplex engine
             // for the new epoch
             let active_validators = self.canonical_state.get_active_validators();
+
+            // If the node's public key is not contained in the new validator list,
+            // trigger an exit
+            if !active_validators
+                .iter()
+                .any(|(pk, _)| pk == &self.node_public_key)
+                && !self
+                    .canonical_state
+                    .validator_is_joining(&self.node_public_key)
+            {
+                self.validator_exit = true;
+            }
+
             self.orchestrator_mailbox
                 .report(Message::Enter(EpochTransition {
                     epoch: Epoch::new(self.canonical_state.epoch),
@@ -539,12 +507,6 @@ impl<
                 }))
                 .await;
             epoch_change = true;
-
-            // Only clear the added and removed validators after saving the state to disk
-            self.canonical_state.added_validators.remove(&next_epoch);
-            if !self.canonical_state.removed_validators.is_empty() {
-                self.canonical_state.removed_validators.clear();
-            }
 
             #[cfg(debug_assertions)]
             {
@@ -639,9 +601,7 @@ impl<
                 &block,
                 &mut fork_state,
                 self.epoch_num_of_blocks,
-                self.validator_max_withdrawals_per_block,
                 self.protocol_version_digest,
-                self.validator_minimum_stake,
                 self.validator_onboarding_limit_per_block,
                 self.validator_num_warm_up_epochs,
                 self.validator_withdrawal_num_epochs,
@@ -750,8 +710,11 @@ impl<
                 };
 
             // Only submit withdrawals at the end of an epoch
-            let ready_withdrawals =
-                state.get_next_ready_withdrawals(height, self.validator_max_withdrawals_per_block);
+            let current_epoch = state.epoch;
+            let ready_withdrawals = state
+                .get_withdrawals_for_epoch(current_epoch)
+                .map(|queue| queue.iter().cloned().collect())
+                .unwrap_or_default();
             let next_epoch = state.epoch;
             BlockAuxData {
                 epoch: state.epoch,
@@ -829,6 +792,108 @@ impl<
                 let header = self.db.get_finalized_header(height).await;
                 let _ = sender.send(ConsensusStateResponse::FinalizedHeader(header));
             }
+            ConsensusStateRequest::GetMinimumStake => {
+                let stake = self.canonical_state.get_minimum_stake();
+                let _ = sender.send(ConsensusStateResponse::MinimumStake(stake));
+            }
+            ConsensusStateRequest::GetMaximumStake => {
+                let stake = self.canonical_state.get_maximum_stake();
+                let _ = sender.send(ConsensusStateResponse::MaximumStake(stake));
+            }
+        }
+    }
+
+    fn update_validator_committee(&mut self, stake_changed: bool) {
+        // Add and remove validators for the next epoch
+        let next_epoch = self.canonical_state.epoch + 1;
+        if self
+            .canonical_state
+            .added_validators
+            .contains_key(&next_epoch)
+            || !self.canonical_state.removed_validators.is_empty()
+        {
+            // Activate validators for the coming epoch.
+            if let Some(added_validators) = self.canonical_state.added_validators.get(&next_epoch) {
+                for key in added_validators {
+                    let key_bytes: [u8; 32] = key.as_ref().try_into().unwrap();
+                    let account = self
+                        .canonical_state
+                        .validator_accounts
+                        .get_mut(&key_bytes)
+                        .expect(
+                            "only validators with accounts are added to the added_validators queue",
+                        );
+                    account.status = ValidatorStatus::Active;
+                }
+            }
+
+            for key in self.canonical_state.removed_validators.iter() {
+                // TODO(matthias): I think this is not necessary. Inactive accounts will be removed after withdrawing.
+                let key_bytes: [u8; 32] = key.as_ref().try_into().unwrap();
+                if let Some(account) = self.canonical_state.validator_accounts.get_mut(&key_bytes) {
+                    account.status = ValidatorStatus::Inactive;
+                }
+            }
+        }
+
+        // Check stake bounds independently of validator additions/removals
+        if stake_changed {
+            // In case the min or max stake parameters changed, we check that the balance of
+            // all validators is in the allowed range [min_stake, max_stake]
+            // Withdrawals happen at the end of the current epoch (last block)
+            let withdrawal_epoch = self.canonical_state.epoch + 1;
+
+            let validators_to_process: Vec<([u8; 32], u64, Address)> = self
+                .canonical_state
+                .validator_accounts
+                .iter()
+                .filter_map(|(key, acc)| {
+                    if acc.balance < self.canonical_state.validator_minimum_stake
+                        || acc.balance > self.canonical_state.validator_maximum_stake
+                    {
+                        Some((*key, acc.balance, acc.withdrawal_credentials))
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+
+            for (key, balance, withdrawal_credentials) in validators_to_process {
+                if balance < self.canonical_state.validator_minimum_stake {
+                    // Remove the validator from the committee and withdraw the full balance
+                    if let Some(account) = self.canonical_state.validator_accounts.get_mut(&key) {
+                        account.status = ValidatorStatus::Inactive;
+                        let withdrawal_request = WithdrawalRequest {
+                            source_address: withdrawal_credentials,
+                            validator_pubkey: key,
+                            amount: balance,
+                        };
+                        self.canonical_state
+                            .push_withdrawal_request(withdrawal_request, withdrawal_epoch);
+
+                        // Mark the account as having a pending withdrawal
+                        if let Some(account) = self.canonical_state.validator_accounts.get_mut(&key)
+                        {
+                            account.has_pending_withdrawal = true;
+                        }
+                    }
+                } else if balance > self.canonical_state.validator_maximum_stake {
+                    // Withdraw the portion of the balance exceeding `validator_maximum_stake`
+                    let excess_amount = balance - self.canonical_state.validator_maximum_stake;
+                    let withdrawal_request = WithdrawalRequest {
+                        source_address: withdrawal_credentials,
+                        validator_pubkey: key,
+                        amount: excess_amount,
+                    };
+                    self.canonical_state
+                        .push_withdrawal_request(withdrawal_request, withdrawal_epoch);
+
+                    // Mark the account as having a pending withdrawal
+                    if let Some(account) = self.canonical_state.validator_accounts.get_mut(&key) {
+                        account.has_pending_withdrawal = true;
+                    }
+                }
+            }
         }
     }
 }
@@ -854,9 +919,7 @@ async fn execute_block<
     block: &Block,
     state: &mut ConsensusState,
     epoch_num_of_blocks: u64,
-    validator_max_withdrawals_per_block: usize,
     protocol_version_digest: Digest,
-    validator_minimum_stake: u64,
     validator_onboarding_limit_per_block: usize,
     validator_num_warm_up_epochs: u64,
     validator_withdrawal_num_epochs: u64,
@@ -880,9 +943,11 @@ async fn execute_block<
     // Make sure that the included withdrawals match the expected withdrawals
     let expected_withdrawals: Vec<Withdrawal> =
         if is_last_block_of_epoch(epoch_num_of_blocks, new_height) {
-            let pending_withdrawals =
-                state.get_next_ready_withdrawals(new_height, validator_max_withdrawals_per_block);
-            pending_withdrawals.into_iter().map(|w| w.inner).collect()
+            let current_epoch = state.epoch;
+            state
+                .get_withdrawals_for_epoch(current_epoch)
+                .map(|queue| queue.iter().map(|w| w.inner).collect())
+                .unwrap_or_default()
         } else {
             vec![]
         };
@@ -909,10 +974,10 @@ async fn execute_block<
             block,
             new_height,
             state,
-            epoch_num_of_blocks,
             protocol_version_digest,
             validator_withdrawal_num_epochs,
-            validator_minimum_stake,
+            state.validator_minimum_stake,
+            state.validator_maximum_stake,
         )
         .await;
 
@@ -934,6 +999,8 @@ async fn execute_block<
             validator_onboarding_limit_per_block,
             validator_num_warm_up_epochs,
             validator_withdrawal_num_epochs,
+            state.validator_minimum_stake,
+            state.validator_maximum_stake,
         )
         .await;
         #[cfg(feature = "prom")]
@@ -966,7 +1033,6 @@ async fn execute_block<
     if is_penultimate_block_of_epoch(epoch_num_of_blocks, new_height) {
         #[cfg(feature = "prom")]
         let checkpoint_creation_start = Instant::now();
-
         let checkpoint = Checkpoint::new(state);
         state.pending_checkpoint = Some(checkpoint);
 
@@ -995,10 +1061,10 @@ async fn parse_execution_requests<
     block: &Block,
     new_height: u64,
     state: &mut ConsensusState,
-    epoch_num_of_blocks: u64,
     protocol_version_digest: Digest,
     validator_withdrawal_num_epochs: u64,
     validator_minimum_stake: u64,
+    validator_maximum_stake: u64,
 ) {
     for request_bytes in &block.execution_requests {
         match ExecutionRequest::try_from_eth_bytes(request_bytes.as_ref()) {
@@ -1008,9 +1074,11 @@ async fn parse_execution_requests<
                         if verify_deposit_request(
                             context,
                             &deposit_request,
+                            state,
                             protocol_version_digest,
                             new_height,
                             validator_minimum_stake,
+                            validator_maximum_stake,
                         ) {
                             state.push_deposit(deposit_request);
                         } else {
@@ -1034,9 +1102,7 @@ async fn parse_execution_requests<
                                 validator_pubkey,
                                 amount: deposit_request.amount,
                             };
-                            let withdrawal_height = new_height
-                                + validator_withdrawal_num_epochs * epoch_num_of_blocks
-                                - 1;
+                            let withdrawal_epoch = state.epoch + validator_withdrawal_num_epochs;
 
                             // If an account exists, we have to temporary increase the `pending_withdrawal_amount`,
                             // otherwise this withdrawal request will decrement the actual account balance.
@@ -1049,7 +1115,7 @@ async fn parse_execution_requests<
 
                             state.push_withdrawal_request(
                                 withdrawal_request.clone(),
-                                withdrawal_height,
+                                withdrawal_epoch,
                             );
                         }
                     }
@@ -1125,13 +1191,24 @@ async fn parse_execution_requests<
                             state.set_account(withdrawal_request.validator_pubkey, account);
 
                             // The withdrawal will be completed in `validator_withdrawal_num_epochs` epochs
-                            let withdrawal_height = new_height
-                                + validator_withdrawal_num_epochs * epoch_num_of_blocks
-                                - 1;
+                            let withdrawal_epoch = state.epoch + validator_withdrawal_num_epochs;
                             state.push_withdrawal_request(
                                 withdrawal_request.clone(),
-                                withdrawal_height,
+                                withdrawal_epoch,
                             );
+                        }
+                    }
+                    ExecutionRequest::ProtocolParam(protocol_param_request) => {
+                        info!("Received protocol param request: {protocol_param_request:?}");
+
+                        match ProtocolParam::try_from(protocol_param_request) {
+                            Ok(protocol_param) => {
+                                info!("Adding protocol param change: {protocol_param:?}");
+                                state.protocol_param_changes.push(protocol_param);
+                            }
+                            Err(e) => {
+                                warn!("Failed to parse protocol param request: {e}");
+                            }
                         }
                     }
                 }
@@ -1155,44 +1232,60 @@ async fn process_execution_requests<
     validator_onboarding_limit_per_block: usize,
     validator_num_warm_up_epochs: u64,
     validator_withdrawal_num_epochs: u64,
+    validator_minimum_stake: u64,
+    validator_maximum_stake: u64,
 ) {
     if is_penultimate_block_of_epoch(epoch_num_of_blocks, new_height) {
         for _ in 0..validator_onboarding_limit_per_block {
             if let Some(request) = state.pop_deposit() {
-                // If the amount is less or more than the minimum stake, or the validator already has a balance
-                // then the deposit will not be processed and a withdrawal is initiated immediately
                 let node_pubkey_bytes = request.node_pubkey.as_ref().try_into().unwrap();
 
                 if let Some(account) = state.validator_accounts.get_mut(&node_pubkey_bytes) {
-                    // We already check that the amount equals the minimum stake when the request is parsed
-                    info!(
-                        "Received deposit request for an existing account, initiating immediate withdrawal: {request:?}"
-                    );
-                    let withdrawal_credentials =
-                        match parse_withdrawal_credentials(request.withdrawal_credentials) {
-                            Ok(withdrawal_credentials) => withdrawal_credentials,
-                            Err(e) => {
-                                warn!("Failed to parse withdrawal credentials: {e}");
-                                continue;
-                            }
+                    // Top-up deposit for existing validator
+                    let new_balance = account.balance + request.amount;
+
+                    // Check if new balance would be within valid range
+                    if new_balance >= validator_minimum_stake
+                        && new_balance <= validator_maximum_stake
+                    {
+                        // Valid top-up: add to balance
+                        info!(
+                            "Processing top-up deposit for existing validator. Current balance: {}, deposit: {}, new balance: {}",
+                            account.balance, request.amount, new_balance
+                        );
+                        account.balance = new_balance;
+                        continue;
+                    } else {
+                        // Invalid: new balance outside range, initiate immediate withdrawal
+                        info!(
+                            "Top-up deposit would result in balance {} outside valid range [{}, {}], initiating immediate withdrawal: {request:?}",
+                            new_balance, validator_minimum_stake, validator_maximum_stake
+                        );
+                        let withdrawal_credentials =
+                            match parse_withdrawal_credentials(request.withdrawal_credentials) {
+                                Ok(withdrawal_credentials) => withdrawal_credentials,
+                                Err(e) => {
+                                    warn!("Failed to parse withdrawal credentials: {e}");
+                                    continue;
+                                }
+                            };
+
+                        let validator_pubkey: [u8; 32] =
+                            request.node_pubkey.as_ref().try_into().unwrap();
+                        let withdrawal_request = WithdrawalRequest {
+                            source_address: withdrawal_credentials,
+                            validator_pubkey,
+                            amount: request.amount,
                         };
+                        let withdrawal_epoch = state.epoch + validator_withdrawal_num_epochs;
 
-                    let validator_pubkey: [u8; 32] =
-                        request.node_pubkey.as_ref().try_into().unwrap();
-                    let withdrawal_request = WithdrawalRequest {
-                        source_address: withdrawal_credentials,
-                        validator_pubkey,
-                        amount: request.amount,
-                    };
-                    let withdrawal_height =
-                        new_height + validator_withdrawal_num_epochs * epoch_num_of_blocks - 1;
+                        // Temporarily increase `pending_withdrawal_amount` so this withdrawal
+                        // doesn't decrement the actual account balance.
+                        account.pending_withdrawal_amount += request.amount;
 
-                    // If an account exists, we have to temporary increase the `pending_withdrawal_amount`,
-                    // otherwise this withdrawal request will decrement the actual account balance.
-                    account.pending_withdrawal_amount += request.amount;
-
-                    state.push_withdrawal_request(withdrawal_request.clone(), withdrawal_height);
-                    continue;
+                        state.push_withdrawal_request(withdrawal_request.clone(), withdrawal_epoch);
+                        continue;
+                    }
                 }
 
                 // Create new validator account
@@ -1204,6 +1297,25 @@ async fn process_execution_requests<
                             continue;
                         }
                     };
+
+                // Check again if the new balance is valid. We already check this above for the case
+                // that a validator account already exists.
+                // This check might not be necessary, because we already check this when parsing the
+                // deposit request.
+                if request.amount < validator_minimum_stake
+                    || request.amount > validator_maximum_stake
+                {
+                    let validator_pubkey: [u8; 32] =
+                        request.node_pubkey.as_ref().try_into().unwrap();
+                    let withdrawal_request = WithdrawalRequest {
+                        source_address: withdrawal_credentials,
+                        validator_pubkey,
+                        amount: request.amount,
+                    };
+                    let withdrawal_epoch = state.epoch + validator_withdrawal_num_epochs;
+                    state.push_withdrawal_request(withdrawal_request.clone(), withdrawal_epoch);
+                    continue;
+                }
 
                 // Create new ValidatorAccount from DepositRequest
                 let activation_epoch = state.epoch + validator_num_warm_up_epochs;
@@ -1247,7 +1359,8 @@ async fn process_execution_requests<
 
     // Remove pending withdrawals that are included in the committed block
     for withdrawal in &block.payload.payload_inner.withdrawals {
-        let pending_withdrawal = state.pop_withdrawal();
+        let current_epoch = state.epoch;
+        let pending_withdrawal = state.pop_withdrawal(current_epoch);
         // TODO(matthias): these checks should never fail. we have to make sure that these withdrawals are
         // verified when the block is verified. it is too late when the block is committed.
         let pending_withdrawal = pending_withdrawal.expect("pending withdrawal must be in state");
@@ -1303,13 +1416,31 @@ async fn process_execution_requests<
 fn verify_deposit_request<R: Storage + Metrics + Clock + Spawner + governor::clock::Clock + Rng>(
     #[allow(unused)] context: &ContextCell<R>,
     deposit_request: &DepositRequest,
+    state: &ConsensusState,
     protocol_version_digest: Digest,
     #[allow(unused)] new_height: u64,
     validator_minimum_stake: u64,
+    validator_maximum_stake: u64,
 ) -> bool {
-    if deposit_request.amount != validator_minimum_stake {
+    // Check if validator already exists
+    let validator_pubkey: [u8; 32] = deposit_request.node_pubkey.as_ref().try_into().unwrap();
+    let existing_balance = state
+        .validator_accounts
+        .get(&validator_pubkey)
+        .map(|account| account.balance)
+        .unwrap_or(0);
+
+    let new_balance = existing_balance + deposit_request.amount;
+
+    // Validate that new balance is within valid range
+    if new_balance > validator_maximum_stake {
         info!(
-            "Received deposit request with amount != minimum stake, initiating immediate withdrawal: {deposit_request:?}"
+            "Deposit would result in balance {} outside valid range [{}, {}] (existing: {}, deposit: {}), initiating immediate withdrawal: {deposit_request:?}",
+            new_balance,
+            validator_minimum_stake,
+            validator_maximum_stake,
+            existing_balance,
+            deposit_request.amount
         );
         return false;
     }

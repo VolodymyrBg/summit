@@ -1,25 +1,23 @@
 /*
-This bin will start 4 reth nodes with an instance of consensus for each and keep running so you can run other tests or submit transactions
+This binary tests protocol parameter updates via the protocol params contract.
 
-Their rpc endpoints are localhost:8545-node_number
-node0_port = 8545
-node1_port = 8544
-...
-node3_port = 8542
+It starts 4 reth nodes with consensus instances, sends a transaction to update a protocol parameter,
+and verifies that all nodes process the change and continue making progress.
 
-
+RPC endpoints:
+node0_port = 3030
+node1_port = 3040
+node2_port = 3050
+node3_port = 3060
 */
 use alloy::network::{EthereumWallet, TransactionBuilder};
 use alloy::providers::{Provider, ProviderBuilder, WalletProvider};
 use alloy::rpc::types::TransactionRequest;
 use alloy::signers::local::PrivateKeySigner;
-use alloy_primitives::{Address, U256};
+use alloy_primitives::Address;
 use clap::Parser;
-use commonware_codec::DecodeExt;
 use commonware_runtime::{Clock, Metrics as _, Runner as _, Spawner as _, tokio as cw_tokio};
-use commonware_utils::from_hex_formatted;
 use futures::{FutureExt, pin_mut};
-use jsonrpsee::core::ClientError;
 use jsonrpsee::http_client::HttpClientBuilder;
 use std::collections::VecDeque;
 use std::time::Duration;
@@ -32,15 +30,13 @@ use std::{
     thread::JoinHandle,
 };
 use summit::args::{RunFlags, run_node_local};
-use summit::engine::{BLOCKS_PER_EPOCH, VALIDATOR_WITHDRAWAL_NUM_EPOCHS};
+use summit::engine::BLOCKS_PER_EPOCH;
 use summit_rpc::SummitApiClient;
-use summit_types::PublicKey;
 use summit_types::reth::Reth;
 use tokio::sync::mpsc;
 use tracing::Level;
 
 const NUM_NODES: u16 = 4;
-const VALIDATOR_MINIMUM_STAKE: u64 = 32_000_000_000;
 
 #[allow(unused)]
 struct NodeRuntime {
@@ -210,13 +206,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             // Wait a bit for nodes to be ready
             context.sleep(Duration::from_secs(2)).await;
 
-            // Send a withdrawal transaction to one of the Reth instances
-            println!("Sending deposit transaction to node 1");
+            // Send a transaction to update the maximum stake protocol parameter
+            println!("Sending protocol parameter update transaction to raise maximum stake to 64 ETH");
             let node0_http_port = handles[1].http_port();
             let node0_url = format!("http://localhost:{}", node0_http_port);
 
-            // Create a test private key and signer
-            let private_key = "0x7c852118294e51e653712a81e05800f419141751be58f605c371e15141b007a6";
+            // Create a test private key and signer.
+            // This private key has to be the owner of the protocol params contract.
+            let private_key = "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80";
             let signer = PrivateKeySigner::from_str(private_key).expect("Failed to create signer");
             let wallet = EthereumWallet::from(signer);
 
@@ -225,35 +222,37 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .wallet(wallet)
                 .connect_http(node0_url.parse().expect("Invalid URL"));
 
-            let withdrawal_contract_address = Address::from_str("0x00000961Ef480Eb55e80D19ad83579A64c007002").unwrap();
-            let pub_key_bytes = from_hex_formatted("f205c8c88d5d1753843dd0fc9810390efd00d6f752dd555c0ad4000bfcac2226").ok_or("PublicKey bad format").unwrap();
-            let pub_key_bytes_ar: [u8; 32] = pub_key_bytes.try_into().unwrap();
-            let _public_key = PublicKey::decode(&pub_key_bytes_ar[..]).map_err(|_| "Unable to decode Public Key").unwrap();
-            let withdrawal_amount = VALIDATOR_MINIMUM_STAKE;
-            let withdrawal_fee = U256::from(1000000000000000u64); // 0.001 ETH fee
+            let protocol_params_contract_address = Address::from_str("0x0000000000000000000000000000506172616D73").unwrap();
 
-            // Check balance before withdrawal
-            let withdrawal_credentials = Address::from_str("0x90F79bf6EB2c4f870365E785982E1f101E93b906").unwrap();
-            let balance_before = provider.get_balance(withdrawal_credentials).await.expect("Failed to get balance before withdrawal");
-            println!("Withdrawal credentials balance before: {} wei", balance_before);
+            // Set parameter ID 0x01 (MaximumStake) to 64 ETH (64_000_000_000 gwei)
+            let param_id: u8 = 0x01; // MaximumStake
+            let new_max_stake: u64 = 64_000_000_000; // 64 ETH in gwei
 
-            send_withdrawal_transaction(&provider, withdrawal_contract_address, &pub_key_bytes_ar, withdrawal_amount, withdrawal_fee, 0)
+            // Encode the u64 value as little-endian bytes
+            let param_data = new_max_stake.to_le_bytes();
+
+            // Encode param with length prefix: [length, ...data]
+            let mut param_value = Vec::with_capacity(param_data.len() + 1);
+            param_value.push(param_data.len() as u8);
+            param_value.extend_from_slice(&param_data);
+
+            send_protocol_params_transaction(&provider, protocol_params_contract_address, param_id, param_value, 0)
                 .await
-                .expect("failed to send deposit transaction");
+                .expect("failed to send protocol params transaction");
 
-            // Wait for all nodes to continue making progress
-            let end_height = BLOCKS_PER_EPOCH * (VALIDATOR_WITHDRAWAL_NUM_EPOCHS + 1);
+            // Wait for nodes to process the transaction and make some progress
+            let target_height = BLOCKS_PER_EPOCH + 1;
             println!(
-                "Waiting for all {} nodes to reach height {}",
-                NUM_NODES, end_height
+                "Waiting for all {} nodes to reach height {} (to ensure protocol param change is processed)",
+                NUM_NODES, target_height
             );
             loop {
                 let mut all_ready = true;
-                for idx in 0..(NUM_NODES - 1) {
+                for idx in 0..NUM_NODES {
                     let rpc_port = get_node_flags(idx as usize).rpc_port;
                     match get_latest_height(rpc_port).await {
                         Ok(height) => {
-                            if height < end_height {
+                            if height < target_height {
                                 all_ready = false;
                                 println!("Node {} at height {}", idx, height);
                             }
@@ -265,88 +264,87 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                 }
                 if all_ready {
-                    println!("All nodes have reached height {}", end_height);
+                    println!("All nodes have reached height {}", target_height);
                     break;
                 }
                 context.sleep(Duration::from_secs(2)).await;
             }
 
-            context.sleep(Duration::from_secs(3)).await;
-
-            // Check that the balance was incremented on the execution layer (Reth)
-            let node0_http_port = handles[0].http_port();
-            let node0_url = format!("http://localhost:{}", node0_http_port);
-            let node0_provider = ProviderBuilder::new().connect_http(node0_url.parse().expect("Invalid URL"));
-
-            // Check
-            let balance_after = node0_provider.get_balance(withdrawal_credentials).await.expect("Failed to get balance after withdrawal");
-            println!("Withdrawal credentials balance after: {} wei", balance_after);
-
-            // The withdrawal amount was VALIDATOR_MINIMUM_STAKE (32 ETH in gwei)
-            // Converting to wei: 32_000_000_000 gwei * 10^9 = 32 * 10^18 wei
-            let expected_difference = U256::from(VALIDATOR_MINIMUM_STAKE) * U256::from(1_000_000_000u64);
-            let actual_difference = balance_after - balance_before;
-
-            // Allow tolerance for gas fees (0.01 ETH = 10^16 wei)
-            let tolerance = U256::from(10_000_000_000_000_000u64);
-            let lower_bound = expected_difference - tolerance;
-            let upper_bound = expected_difference + tolerance;
-            assert!(actual_difference >= lower_bound && actual_difference <= upper_bound,
-                "Balance difference {} is outside expected range [{}, {}]",
-                actual_difference, lower_bound, upper_bound);
-            println!("Withdrawal successful: balance increased by {} wei (expected ~{})",
-                actual_difference, expected_difference);
-
-            // Check that the validator was removed from the consensus state
+            // Verify that the maximum stake was correctly updated
+            println!("Verifying maximum stake was updated to {} gwei...", new_max_stake);
             let rpc_port = get_node_flags(0).rpc_port;
-            let validator_balance = get_validator_balance(rpc_port, "f205c8c88d5d1753843dd0fc9810390efd00d6f752dd555c0ad4000bfcac2226".to_string()).await;
-            if let Err(e) = validator_balance {
-                // Parse the JSON-RPC error
-                if let Some(ClientError::Call(err)) = e.downcast_ref::<ClientError>() {
-                    assert_eq!(err.message(), "Validator not found");
-                    println!("Success: validator that withdrew is not on the consensus state anymore");
-                } else {
-                    panic!("Expected JSON-RPC Call error with 'Validator not found', got: {}", e);
-                }
-            } else {
-                panic!("Validator should not be on the consensus state anymore");
-            }
+            let url = format!("http://localhost:{}", rpc_port);
+            let client = HttpClientBuilder::default().build(&url).expect("Failed to create RPC client");
+
+            let max_stake = client.get_maximum_stake().await.expect("Failed to get maximum stake");
+            println!("Current maximum stake: {} gwei", max_stake);
+
+            assert_eq!(max_stake, new_max_stake, "Maximum stake should be {} gwei", new_max_stake);
+            println!("✓ Maximum stake successfully updated to {} gwei!", new_max_stake);
+
+            println!("Protocol parameter change test completed successfully!");
 
             Ok(())
         }
     })
 }
 
-async fn send_withdrawal_transaction<P>(
+async fn send_protocol_params_transaction<P>(
     provider: &P,
-    withdrawal_contract_address: Address,
-    //validator_pubkey: &[u8; 48],
-    ed25519_pubkey: &[u8; 32],
-    withdrawal_amount: u64, // Amount in gwei
-    withdrawal_fee: U256,   // Current fee required by the contract
+    protocol_params_contract_address: Address,
+    param_id: u8,
+    param_value: Vec<u8>,
     nonce: u64,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
 where
     P: Provider + WalletProvider,
 {
-    // Left-pad ed25519 key to 48 bytes for the contract (prepend zeros)
-    let mut padded_pubkey = [0u8; 48];
-    padded_pubkey[16..48].copy_from_slice(ed25519_pubkey);
+    use alloy_primitives::keccak256;
 
-    // EIP-7002: Input is exactly 56 bytes: validator_pubkey (48 bytes) + amount (8 bytes, big-endian uint64)
-    let mut call_data = Vec::with_capacity(56);
+    // ABI encode the function call: set_param(uint8 param_id, bytes calldata param)
+    // Function selector is first 4 bytes of keccak256("set_param(uint8,bytes)")
+    let function_selector = &keccak256("set_param(uint8,bytes)")[0..4];
 
-    // Add validator pubkey (48 bytes)
-    call_data.extend_from_slice(&padded_pubkey);
+    // ABI encoding:
+    // - 4 bytes: function selector
+    // - 32 bytes: param_id (uint8 left-padded to 32 bytes)
+    // - 32 bytes: offset to bytes data (always 0x40 = 64 bytes from start of params)
+    // - 32 bytes: length of bytes data
+    // - N bytes: actual bytes data (padded to 32-byte boundary)
 
-    // Add withdrawal amount (8 bytes, big-endian uint64)
-    call_data.extend_from_slice(&withdrawal_amount.to_be_bytes());
+    let mut call_data = Vec::new();
+
+    // Add function selector
+    call_data.extend_from_slice(function_selector);
+
+    // Add param_id (uint8 left-padded to 32 bytes)
+    let mut param_id_bytes = [0u8; 32];
+    param_id_bytes[31] = param_id;
+    call_data.extend_from_slice(&param_id_bytes);
+
+    // Add offset to bytes data (0x40 = 64 bytes from start of parameter encoding)
+    let mut offset_bytes = [0u8; 32];
+    offset_bytes[28..32].copy_from_slice(&64u32.to_be_bytes());
+    call_data.extend_from_slice(&offset_bytes);
+
+    // Add length of bytes data
+    let mut length_bytes = [0u8; 32];
+    length_bytes[28..32].copy_from_slice(&(param_value.len() as u32).to_be_bytes());
+    call_data.extend_from_slice(&length_bytes);
+
+    // Add the actual bytes data
+    call_data.extend_from_slice(&param_value);
+
+    // Pad to 32-byte boundary if needed
+    let padding_needed = (32 - (param_value.len() % 32)) % 32;
+    if padding_needed > 0 {
+        call_data.extend_from_slice(&vec![0u8; padding_needed]);
+    }
 
     let tx_request = TransactionRequest::default()
-        .to(withdrawal_contract_address)
-        .value(withdrawal_fee) // Must send enough ETH to cover withdrawal request fee
+        .to(protocol_params_contract_address)
         .input(call_data.into())
-        .with_gas_limit(500_000) // Lower gas limit for simpler operation
+        .with_gas_limit(500_000)
         .with_gas_price(1_000_000_000) // 1 gwei
         .with_nonce(nonce);
 
@@ -370,16 +368,6 @@ async fn get_latest_height(rpc_port: u16) -> Result<u64, Box<dyn std::error::Err
     let client = HttpClientBuilder::default().build(&url)?;
     let height = client.get_latest_height().await?;
     Ok(height)
-}
-
-async fn get_validator_balance(
-    rpc_port: u16,
-    public_key: String,
-) -> Result<u64, Box<dyn std::error::Error>> {
-    let url = format!("http://localhost:{}", rpc_port);
-    let client = HttpClientBuilder::default().build(&url)?;
-    let balance = client.get_validator_balance(public_key).await?;
-    Ok(balance)
 }
 
 fn get_node_flags(node: usize) -> RunFlags {

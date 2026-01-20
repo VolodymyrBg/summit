@@ -152,13 +152,16 @@ mod tests {
             head_digest: commonware_cryptography::sha256::Digest([0u8; 32]),
             next_withdrawal_index: 100,
             deposit_queue: VecDeque::new(),
-            withdrawal_queue: VecDeque::new(),
+            withdrawal_queue: BTreeMap::new(),
             validator_accounts: BTreeMap::new(),
+            protocol_param_changes: Vec::new(),
             pending_checkpoint: None,
             added_validators: BTreeMap::new(),
             removed_validators: Vec::new(),
             forkchoice: Default::default(),
             epoch_genesis_hash: [0u8; 32],
+            validator_minimum_stake: 32_000_000_000, // 32 ETH in gwei
+            validator_maximum_stake: 32_000_000_000, // 32 ETH in gwei
         };
 
         let checkpoint = Checkpoint::new(&state);
@@ -215,7 +218,6 @@ mod tests {
                 address: Address::from([3u8; 20]),
                 amount: 8_000_000_000, // 8 ETH in gwei
             },
-            withdrawal_height: 500,
             pubkey: [5u8; 32],
         };
 
@@ -248,8 +250,10 @@ mod tests {
         deposit_queue.push_back(deposit1);
         deposit_queue.push_back(deposit2);
 
-        let mut withdrawal_queue = VecDeque::new();
-        withdrawal_queue.push_back(pending_withdrawal);
+        let mut withdrawal_queue = BTreeMap::new();
+        let mut epoch_queue = VecDeque::new();
+        epoch_queue.push_back(pending_withdrawal);
+        withdrawal_queue.insert(5, epoch_queue); // epoch 5
 
         let mut validator_accounts = BTreeMap::new();
         validator_accounts.insert([10u8; 32], validator_account1);
@@ -263,12 +267,15 @@ mod tests {
             next_withdrawal_index: 200,
             deposit_queue,
             withdrawal_queue,
+            protocol_param_changes: Vec::new(),
             validator_accounts,
             pending_checkpoint: None,
             added_validators: BTreeMap::new(),
             removed_validators: Vec::new(),
             forkchoice: Default::default(),
             epoch_genesis_hash: [0u8; 32],
+            validator_minimum_stake: 32_000_000_000, // 32 ETH in gwei
+            validator_maximum_stake: 32_000_000_000, // 32 ETH in gwei
         };
 
         let checkpoint = Checkpoint::new(&state);
@@ -298,13 +305,16 @@ mod tests {
             head_digest: sha256::Digest([0u8; 32]),
             next_withdrawal_index: 99,
             deposit_queue: VecDeque::new(),
-            withdrawal_queue: VecDeque::new(),
+            withdrawal_queue: BTreeMap::new(),
             validator_accounts: BTreeMap::new(),
+            protocol_param_changes: Vec::new(),
             pending_checkpoint: None,
             added_validators: BTreeMap::new(),
             removed_validators: Vec::new(),
             forkchoice: Default::default(),
             epoch_genesis_hash: [0u8; 32],
+            validator_minimum_stake: 32_000_000_000, // 32 ETH in gwei
+            validator_maximum_stake: 32_000_000_000, // 32 ETH in gwei
         };
 
         let checkpoint = Checkpoint::new(&state);
@@ -368,7 +378,6 @@ mod tests {
                 address: Address::from([3u8; 20]),
                 amount: 8_000_000_000, // 8 ETH in gwei
             },
-            withdrawal_height: 500,
             pubkey: [5u8; 32],
         };
 
@@ -401,8 +410,10 @@ mod tests {
         deposit_queue.push_back(deposit1);
         deposit_queue.push_back(deposit2);
 
-        let mut withdrawal_queue = VecDeque::new();
-        withdrawal_queue.push_back(pending_withdrawal);
+        let mut withdrawal_queue = BTreeMap::new();
+        let mut epoch_queue = VecDeque::new();
+        epoch_queue.push_back(pending_withdrawal);
+        withdrawal_queue.insert(5, epoch_queue); // epoch 5
 
         let mut validator_accounts = BTreeMap::new();
         validator_accounts.insert([10u8; 32], validator_account1);
@@ -416,12 +427,15 @@ mod tests {
             next_withdrawal_index: 300,
             deposit_queue,
             withdrawal_queue,
+            protocol_param_changes: Vec::new(),
             validator_accounts,
             pending_checkpoint: None,
             added_validators: BTreeMap::new(),
             removed_validators: Vec::new(),
             forkchoice: Default::default(),
             epoch_genesis_hash: [0u8; 32],
+            validator_minimum_stake: 32_000_000_000, // 32 ETH in gwei
+            validator_maximum_stake: 32_000_000_000, // 32 ETH in gwei
         };
 
         let checkpoint = Checkpoint::new(&state);
@@ -456,13 +470,16 @@ mod tests {
             head_digest: sha256::Digest([0u8; 32]),
             next_withdrawal_index: 99,
             deposit_queue: VecDeque::new(),
-            withdrawal_queue: VecDeque::new(),
+            withdrawal_queue: BTreeMap::new(),
             validator_accounts: BTreeMap::new(),
+            protocol_param_changes: Vec::new(),
             pending_checkpoint: None,
             added_validators: BTreeMap::new(),
             removed_validators: Vec::new(),
             forkchoice: Default::default(),
             epoch_genesis_hash: [0u8; 32],
+            validator_minimum_stake: 32_000_000_000, // 32 ETH in gwei
+            validator_maximum_stake: 32_000_000_000, // 32 ETH in gwei
         };
 
         let checkpoint = Checkpoint::new(&state);
@@ -503,13 +520,16 @@ mod tests {
             head_digest: sha256::Digest([0u8; 32]),
             next_withdrawal_index: 99,
             deposit_queue: VecDeque::new(),
-            withdrawal_queue: VecDeque::new(),
+            withdrawal_queue: BTreeMap::new(),
             validator_accounts: BTreeMap::new(),
+            protocol_param_changes: Vec::new(),
             pending_checkpoint: None,
             added_validators: BTreeMap::new(),
             removed_validators: Vec::new(),
             forkchoice: Default::default(),
             epoch_genesis_hash: [0u8; 32],
+            validator_minimum_stake: 32_000_000_000, // 32 ETH in gwei
+            validator_maximum_stake: 32_000_000_000, // 32 ETH in gwei
         };
 
         let checkpoint = Checkpoint::new(&original_state);
@@ -546,13 +566,16 @@ mod tests {
             head_digest: sha256::Digest([0u8; 32]),
             next_withdrawal_index: 99,
             deposit_queue: VecDeque::new(),
-            withdrawal_queue: VecDeque::new(),
+            withdrawal_queue: BTreeMap::new(),
             validator_accounts: BTreeMap::new(),
+            protocol_param_changes: Vec::new(),
             pending_checkpoint: None,
             added_validators: BTreeMap::new(),
             removed_validators: Vec::new(),
             forkchoice: Default::default(),
             epoch_genesis_hash: [0u8; 32],
+            validator_minimum_stake: 32_000_000_000, // 32 ETH in gwei
+            validator_maximum_stake: 32_000_000_000, // 32 ETH in gwei
         };
 
         let mut checkpoint = Checkpoint::new(&original_state);
@@ -599,7 +622,6 @@ mod tests {
                 address: Address::from([3u8; 20]),
                 amount: 8_000_000_000, // 8 ETH in gwei
             },
-            withdrawal_height: 500,
             pubkey: [5u8; 32],
         };
 
@@ -619,8 +641,10 @@ mod tests {
         let mut deposit_queue = VecDeque::new();
         deposit_queue.push_back(deposit1);
 
-        let mut withdrawal_queue = VecDeque::new();
-        withdrawal_queue.push_back(pending_withdrawal);
+        let mut withdrawal_queue = BTreeMap::new();
+        let mut epoch_queue = VecDeque::new();
+        epoch_queue.push_back(pending_withdrawal);
+        withdrawal_queue.insert(5, epoch_queue); // epoch 5
 
         let mut validator_accounts = BTreeMap::new();
         validator_accounts.insert([10u8; 32], validator_account1);
@@ -633,12 +657,15 @@ mod tests {
             next_withdrawal_index: 200,
             deposit_queue,
             withdrawal_queue,
+            protocol_param_changes: Vec::new(),
             validator_accounts,
             pending_checkpoint: None,
             added_validators: BTreeMap::new(),
             removed_validators: Vec::new(),
             forkchoice: Default::default(),
             epoch_genesis_hash: [0u8; 32],
+            validator_minimum_stake: 32_000_000_000, // 32 ETH in gwei
+            validator_maximum_stake: 32_000_000_000, // 32 ETH in gwei
         };
 
         let checkpoint = Checkpoint::new(&original_state);
@@ -657,10 +684,8 @@ mod tests {
 
         // Verify specific content
         assert_eq!(converted_state.deposit_queue[0].amount, 32_000_000_000);
-        assert_eq!(
-            converted_state.withdrawal_queue[0].inner.amount,
-            8_000_000_000
-        );
+        let epoch5_withdrawals = converted_state.get_withdrawals_for_epoch(5).unwrap();
+        assert_eq!(epoch5_withdrawals[0].inner.amount, 8_000_000_000);
         assert_eq!(
             converted_state
                 .validator_accounts
