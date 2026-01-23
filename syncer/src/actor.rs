@@ -54,6 +54,7 @@ use tracing::{debug, error, info, warn};
 
 use commonware_cryptography::certificate::Provider;
 use summit_types::utils;
+use summit_types::{Digest, FinalizedHeader};
 
 /// The key used to store the last processed height in the metadata store.
 const LATEST_KEY: U64 = U64::new(0xFF);
@@ -102,7 +103,7 @@ struct BlockSubscription<B: Block> {
 pub struct Actor<E, B, P, FC, FB, T, A = Exact>
 where
     E: CryptoRngCore + Spawner + Metrics + Clock + GClock + Storage,
-    B: Block,
+    B: Block<Commitment = Digest>,
     P: Provider<Scope = Epoch, Scheme: Scheme<B::Commitment>>,
     FC: Certificates<Commitment = B::Commitment, Scheme = P::Scheme>,
     FB: Blocks<Block = B>,
@@ -164,7 +165,7 @@ where
 impl<E, B, P, FC, FB, T, A> Actor<E, B, P, FC, FB, T, A>
 where
     E: CryptoRngCore + Spawner + Metrics + Clock + GClock + Storage,
-    B: Block,
+    B: Block<Commitment = Digest>,
     P: Provider<Scope = Epoch, Scheme: Scheme<B::Commitment>>,
     FC: Certificates<Commitment = B::Commitment, Scheme = P::Scheme>,
     FB: Blocks<Block = B>,
@@ -290,6 +291,7 @@ where
         sync_epoch: u64,
         sync_view: u64,
         checkpoint_last_block: Option<B>,
+        checkpoint_finalized_header: Option<FinalizedHeader<P::Scheme>>,
     ) -> Handle<()>
     where
         R: Resolver<
@@ -307,7 +309,8 @@ where
                 sync_height,
                 sync_epoch,
                 sync_view,
-                checkpoint_last_block
+                checkpoint_last_block,
+                checkpoint_finalized_header,
             )
             .await
         )
@@ -324,6 +327,7 @@ where
         sync_epoch: u64,
         sync_view: u64,
         checkpoint_last_block: Option<B>,
+        checkpoint_finalized_header: Option<FinalizedHeader<P::Scheme>>,
     ) where
         R: Resolver<
                 Key = handler::Request<B>,
@@ -338,11 +342,12 @@ where
         // If we have a checkpoint last block meaning we loaded from checkpoint, finalize it to complete the checkpoint
         if let Some(last_block) = checkpoint_last_block {
             let height = last_block.height().get();
+            let finalization = checkpoint_finalized_header.map(|h| h.finalization);
             self.finalize(
                 height,
                 last_block.commitment(),
                 last_block,
-                None,
+                finalization,
                 &mut application,
                 &mut buffer,
                 &mut resolver,
