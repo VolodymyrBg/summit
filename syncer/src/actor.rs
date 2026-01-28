@@ -338,6 +338,7 @@ where
         self.last_processed_height = sync_height;
         self.last_processed_round = Round::new(Epoch::new(sync_epoch), View::new(sync_view));
         self.tip = sync_height;
+        info!(sync_height, sync_epoch, sync_view, "syncer initialized");
 
         // If we have a checkpoint last block meaning we loaded from checkpoint, finalize it to complete the checkpoint
         if let Some(last_block) = checkpoint_last_block {
@@ -1014,6 +1015,15 @@ where
 
         // Update metrics and send tip update to application
         if height > self.tip {
+            let gap = height - self.tip;
+            if gap > 1 {
+                debug!(
+                    previous_tip = self.tip,
+                    new_tip = height,
+                    gap,
+                    "tip advanced by multiple blocks (catch-up)"
+                );
+            }
             application.report(Update::Tip(height, commitment)).await;
             self.tip = height;
             #[cfg(feature = "prom")]
@@ -1109,10 +1119,20 @@ where
                         application,
                     )
                     .await;
-                    debug!(height = block.height().get(), "repaired block");
+                    debug!(
+                        height = block.height().get(),
+                        gap_start = gap_start.get(),
+                        gap_end = gap_end.get(),
+                        "repaired missing block from local storage"
+                    );
                     cursor = block;
                 } else {
                     // Request the next missing block digest
+                    debug!(
+                        ?commitment,
+                        target_height = cursor.height().get() - 1,
+                        "requesting missing block from network for gap repair"
+                    );
                     resolver.fetch(Request::<B>::Block(commitment)).await;
                     break 'cache_repair;
                 }
