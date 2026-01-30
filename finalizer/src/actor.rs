@@ -1,6 +1,5 @@
 use crate::db::{Config as StateConfig, FinalizerState};
 use crate::{FinalizerConfig, FinalizerMailbox, FinalizerMessage};
-use alloy_eips::eip4895::Withdrawal;
 use alloy_primitives::Address;
 use alloy_rpc_types_engine::ForkchoiceState;
 #[allow(unused)]
@@ -39,7 +38,9 @@ use summit_types::utils::{
     is_first_block_of_epoch, is_last_block_of_epoch, is_penultimate_block_of_epoch,
     parse_withdrawal_credentials,
 };
-use summit_types::{Block, BlockAuxData, Digest, FinalizedHeader, PublicKey, Signature};
+use summit_types::{
+    AddedValidator, Block, BlockAuxData, Digest, FinalizedHeader, PublicKey, Signature,
+};
 use summit_types::{EngineClient, consensus_state::ConsensusState};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, trace, warn};
@@ -856,8 +857,8 @@ impl<
         {
             // Activate validators for the coming epoch.
             if let Some(added_validators) = self.canonical_state.added_validators.get(&next_epoch) {
-                for key in added_validators {
-                    let key_bytes: [u8; 32] = key.as_ref().try_into().unwrap();
+                for validator in added_validators {
+                    let key_bytes: [u8; 32] = validator.node_key.as_ref().try_into().unwrap();
                     let account = self
                         .canonical_state
                         .validator_accounts
@@ -1022,24 +1023,9 @@ async fn execute_block<
         histogram!("payload_check_duration_millis").record(payload_check_duration);
     }
 
-    // Verify withdrawal requests that were included in the block
-    // Make sure that the included withdrawals match the expected withdrawals
-    let expected_withdrawals: Vec<Withdrawal> =
-        if is_last_block_of_epoch(epoch_num_of_blocks, new_height) {
-            let current_epoch = state.epoch;
-            state
-                .get_withdrawals_for_epoch(current_epoch)
-                .map(|queue| queue.iter().map(|w| w.inner).collect())
-                .unwrap_or_default()
-        } else {
-            vec![]
-        };
-
-    // Validate block against state
-    if payload_status.is_valid()
-        && block.payload.payload_inner.withdrawals == expected_withdrawals
-        && state.forkchoice.head_block_hash == block.eth_parent_hash()
-    {
+    // Validate block against execution layer state
+    // Note: withdrawals are validated in the application layer before voting
+    if payload_status.is_valid() && state.forkchoice.head_block_hash == block.eth_parent_hash() {
         let eth_hash = block.eth_block_hash();
         let tx_count = block.payload.payload_inner.payload_inner.transactions.len();
         info!(
@@ -1064,6 +1050,7 @@ async fn execute_block<
             validator_withdrawal_num_epochs,
             state.validator_minimum_stake,
             state.validator_maximum_stake,
+            epoch_num_of_blocks,
         )
         .await;
 
@@ -1097,12 +1084,10 @@ async fn execute_block<
         }
     } else {
         let payload_valid = payload_status.is_valid();
-        let withdrawals_match = block.payload.payload_inner.withdrawals == expected_withdrawals;
         let parent_matches = state.forkchoice.head_block_hash == block.eth_parent_hash();
         warn!(
             new_height,
             payload_valid,
-            withdrawals_match,
             parent_matches,
             "block validation failed, not executing but keeping in chain"
         );
@@ -1164,8 +1149,13 @@ async fn parse_execution_requests<
     validator_withdrawal_num_epochs: u64,
     validator_minimum_stake: u64,
     validator_maximum_stake: u64,
+    epoch_num_of_blocks: u64,
 ) {
-    for request_bytes in &block.execution_requests {
+    // Combine any pending execution requests with the current block's requests
+    let mut all_requests = std::mem::take(&mut state.pending_execution_requests);
+    all_requests.extend(block.execution_requests.iter().cloned());
+
+    for request_bytes in &all_requests {
         match ExecutionRequest::try_from_eth_bytes(request_bytes.as_ref()) {
             Ok(execution_request) => {
                 match execution_request {
@@ -1193,6 +1183,9 @@ async fn parse_execution_requests<
                                 ) {
                                     Ok(withdrawal_credentials) => withdrawal_credentials,
                                     Err(e) => {
+                                        // The deposited funds would be lost in this case.
+                                        // The deposit contract verifies that the withdrawal credentials
+                                        // follow the expected format, so this should never happen.
                                         warn!("Failed to parse withdrawal credentials: {e}");
                                         continue;
                                     }
@@ -1220,6 +1213,9 @@ async fn parse_execution_requests<
                             ) {
                                 Ok(withdrawal_credentials) => withdrawal_credentials,
                                 Err(e) => {
+                                    // The deposited funds would be lost in this case.
+                                    // The deposit contract verifies that the withdrawal credentials
+                                    // follow the expected format, so this should never happen.
                                     warn!("Failed to parse withdrawal credentials: {e}");
                                     continue;
                                 }
@@ -1301,7 +1297,7 @@ async fn parse_execution_requests<
                                 if let Some(validators) =
                                     state.added_validators.get_mut(&account.joining_epoch)
                                     && let Some(pos) =
-                                        validators.iter().position(|v| v == &public_key)
+                                        validators.iter().position(|v| v.node_key == public_key)
                                 {
                                     validators.remove(pos);
                                     info!(
@@ -1311,6 +1307,18 @@ async fn parse_execution_requests<
                                         "cancelled pending validator activation due to withdrawal request"
                                     );
                                 }
+                            } else if is_last_block_of_epoch(epoch_num_of_blocks, new_height) {
+                                // On the last block of an epoch, buffer the withdrawal request
+                                // to be processed at the penultimate block of the next epoch.
+                                // This ensures the validator is included in removed_validators
+                                // which can be properly reflected in the header.
+                                info!(
+                                    validator = hex::encode(withdrawal_request.validator_pubkey),
+                                    current_epoch = state.epoch,
+                                    "buffering withdrawal request for active validator on last block of epoch"
+                                );
+                                state.pending_execution_requests.push(request_bytes.clone());
+                                continue;
                             } else {
                                 // Validator is already active - add to removed_validators
                                 state.removed_validators.push(public_key);
@@ -1420,12 +1428,20 @@ async fn process_execution_requests<
 
                     // Activate the new validator
                     let activation_epoch = state.epoch + validator_num_warm_up_epochs;
+                    // Clone the consensus key before add_validator since it needs &mut state
+                    let consensus_key = account.consensus_public_key.clone();
                     account.balance = new_balance;
                     account.status = ValidatorStatus::Joining;
                     account.joining_epoch = activation_epoch;
                     account.last_deposit_index = request.index;
 
-                    state.add_validator(activation_epoch, request.node_pubkey.clone());
+                    state.add_validator(
+                        activation_epoch,
+                        AddedValidator {
+                            node_key: request.node_pubkey.clone(),
+                            consensus_key,
+                        },
+                    );
 
                     info!(
                         validator = hex::encode(node_pubkey_bytes),
