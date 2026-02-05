@@ -20,16 +20,12 @@ use commonware_cryptography::bls12381::primitives::variant::Variant;
 use commonware_cryptography::{PublicKey, Signer};
 use futures::task::Poll;
 use std::marker::PhantomData;
-use std::{
-    pin::Pin,
-    sync::{Arc, Mutex},
-    time::Duration,
-};
+use std::{pin::Pin, time::Duration};
 use summit_finalizer::FinalizerMailbox;
 use tracing::{debug, info, warn};
 
 #[cfg(feature = "prom")]
-use metrics::{counter, histogram};
+use metrics::histogram;
 use summit_syncer::ingress::mailbox::Mailbox as SyncerMailbox;
 use summit_types::{Block, BlockAuxData, Digest, EngineClient, utils};
 
@@ -66,7 +62,6 @@ pub struct Actor<
     context: ContextCell<R>,
     mailbox: mpsc::Receiver<Message>,
     engine_client: C,
-    built_block: Arc<Mutex<Option<(Block, Round)>>>,
     genesis_hash: [u8; 32],
     epoch_num_of_blocks: u64,
     cancellation_token: CancellationToken,
@@ -95,7 +90,6 @@ impl<
                 context: ContextCell::new(context),
                 mailbox: rx,
                 engine_client: cfg.engine_client,
-                built_block: Arc::new(Mutex::new(None)),
                 genesis_hash,
                 epoch_num_of_blocks: cfg.epoch_num_of_blocks,
                 cancellation_token: cfg.cancellation_token,
@@ -151,76 +145,35 @@ impl<
                             debug!("{rand_id} application: Handling message Propose for round {} (epoch {}, view {}), parent view: {}",
                                 round, round.epoch(), round.view(), parent.0);
 
-                            let built = self.built_block.clone();
-                            #[cfg(feature = "prom")]
-                            let proposal_start = std::time::Instant::now();
+                            let built = self.handle_proposal(parent, &mut syncer, &mut finalizer, round).await;
 
-                            select! {
-                                    res = self.handle_proposal(parent, &mut syncer, &mut finalizer, round) => {
-                                        match res {
-                                            Ok(block) => {
-                                                // store block
-                                                let digest = block.digest();
-                                                let height = block.height();
-                                                let tx_count = block.payload.payload_inner.payload_inner.transactions.len();
-                                                {
-                                                    let mut built = built.lock().expect("locked poisoned");
-                                                    *built = Some((block.clone(), round));
-                                                }
+                            match built {
+                                Ok(block) => {
+                                    // store block
+                                    let digest = block.digest();
+                                    let height = block.height();
+                                    let tx_count = block.payload.payload_inner.payload_inner.transactions.len();
 
-                                                info!(
-                                                    height,
-                                                    epoch = round.epoch().get(),
-                                                    view = round.view().get(),
-                                                    tx_count,
-                                                    "proposed block"
-                                                );
+                                    info!(
+                                        height,
+                                        epoch = round.epoch().get(),
+                                        view = round.view().get(),
+                                        tx_count,
+                                        "proposed block"
+                                    );
 
-                                                // send block to syncer for caching and broadcasting
-                                                syncer.proposed(round, block).await;
+                                    // send block to syncer for caching and broadcasting
+                                    syncer.proposed(round, block).await;
 
-                                                // send digest to consensus
-                                                let _ = response.send(digest);
-                                            },
-                                            Err(e) => warn!("Failed to create a block for round {round}: {e}")
-                                        }
-                                    },
-                                    _ = oneshot_closed_future(&mut response) => {
-                                        // simplex dropped receiver
-                                        #[cfg(feature = "prom")]
-                                        {
-                                            let elapsed = proposal_start.elapsed();
-                                            warn!(
-                                                round = ?round,
-                                                parent_view = parent.0.get(),
-                                                parent_digest = ?parent.1,
-                                                elapsed_ms = elapsed.as_millis(),
-                                                "proposal aborted - consensus timed out waiting for block (possible notarize-nullify race)"
-                                            );
-                                            counter!("proposal_timeout_total").increment(1);
-                                            histogram!("proposal_timeout_elapsed_ms").record(elapsed.as_millis() as f64);
-                                        }
-
-                                        #[cfg(not(feature = "prom"))]
-                                        warn!(
-                                            round = ?round,
-                                            parent_view = parent.0.get(),
-                                            parent_digest = ?parent.1,
-                                            "proposal aborted - consensus timed out waiting for block (possible notarize-nullify race)"
-                                        );
-                                    }
+                                    // send digest to consensus
+                                    let _ = response.send(digest);
+                                },
+                                Err(e) => warn!("Failed to create a block for round {round}: {e}"),
                             }
                         }
                         Message::Broadcast { payload: _ } => {
-                            info!("{rand_id} Handling message Broadcast");
-
-                            let built_block = self.built_block.lock().expect("poisoned lock").take();
-
-                            if let Some((block, round)) = built_block {
-                                syncer.proposed(round, block).await;
-                            } else {
-                                warn!("Asked to broadcast a block without one built");
-                            }
+                            // The block has already been sent to the syncer in the Propose path.
+                            info!("{rand_id} Handling message Broadcast (no-op, block already broadcast on propose)");
                         }
 
                         Message::Verify {
