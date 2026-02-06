@@ -22,10 +22,11 @@ use std::num::NonZero;
 use std::time::Duration;
 use summit_application::ApplicationConfig;
 use summit_finalizer::actor::Finalizer;
-use summit_finalizer::{FinalizerConfig, FinalizerMailbox};
+use summit_finalizer::{FinalizerConfig, FinalizerMailbox, ProtocolConsts};
+use summit_syncer::{SyncCheckpoint, SyncStart};
 use summit_types::network_oracle::NetworkOracle;
 use summit_types::scheme::{MultisigScheme, SummitSchemeProvider};
-use summit_types::{Block, EngineClient, FinalizedHeader, PublicKey};
+use summit_types::{Block, EngineClient, PublicKey};
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
@@ -102,11 +103,8 @@ pub struct Engine<
     oracle: O,
     node_public_key: PublicKey,
     mailbox_size: usize,
-    sync_height: u64,
-    sync_epoch: u64,
-    sync_view: u64,
-    checkpoint_last_block: Option<Block>,
-    checkpoint_finalized_header: Option<FinalizedHeader<MultisigScheme>>,
+    sync_start: SyncStart,
+    checkpoint: Option<SyncCheckpoint<Block, MultisigScheme>>,
     cancellation_token: CancellationToken,
 }
 
@@ -294,11 +292,13 @@ where
                 engine_client: cfg.engine_client,
                 oracle: cfg.oracle.clone(),
                 orchestrator_mailbox,
-                epoch_num_of_blocks: BLOCKS_PER_EPOCH,
+                protocol_consts: ProtocolConsts {
+                    epoch_num_of_blocks: BLOCKS_PER_EPOCH,
+                    validator_onboarding_limit_per_block: VALIDATOR_ONBOARDING_LIMIT_PER_BLOCK,
+                    validator_num_warm_up_epochs: VALIDATOR_NUM_WARM_UP_EPOCHS,
+                    validator_withdrawal_num_epochs: VALIDATOR_WITHDRAWAL_NUM_EPOCHS,
+                },
                 validator_max_withdrawals_per_block: VALIDATOR_MAX_WITHDRAWALS_PER_BLOCK,
-                validator_withdrawal_num_epochs: VALIDATOR_WITHDRAWAL_NUM_EPOCHS,
-                validator_onboarding_limit_per_block: VALIDATOR_ONBOARDING_LIMIT_PER_BLOCK,
-                validator_num_warm_up_epochs: VALIDATOR_NUM_WARM_UP_EPOCHS,
                 page_cache: page_cache.clone(),
                 genesis_hash: cfg.genesis_hash,
                 initial_state: cfg.initial_state,
@@ -311,19 +311,26 @@ where
         .await;
         // Initialize the sync variables from the consensus state returned by the finalizer.
         // This covers the case where the finalizer reads the consensus state from disk.
-        let sync_height = initial_state.latest_height;
-        let sync_epoch = initial_state.epoch;
-        let sync_view = initial_state.view;
+        let sync_start = SyncStart {
+            height: initial_state.latest_height,
+            epoch: initial_state.epoch,
+            view: initial_state.view,
+        };
         let num_validators = initial_state.validator_accounts.len();
 
         info!(
-            sync_height,
-            sync_epoch,
-            sync_view,
+            sync_height = sync_start.height,
+            sync_epoch = sync_start.epoch,
+            sync_view = sync_start.view,
             num_validators,
             blocks_per_epoch = BLOCKS_PER_EPOCH,
             "engine initialized"
         );
+
+        let checkpoint = cfg.checkpoint_last_block.map(|last_block| SyncCheckpoint {
+            last_block,
+            finalized_header: cfg.checkpoint_finalized_header,
+        });
 
         Self {
             context,
@@ -338,11 +345,8 @@ where
             oracle: cfg.oracle,
             node_public_key: cfg.key_store.node_key.public_key(),
             mailbox_size: cfg.mailbox_size,
-            sync_height,
-            sync_epoch,
-            sync_view,
-            checkpoint_last_block: cfg.checkpoint_last_block,
-            checkpoint_finalized_header: cfg.checkpoint_finalized_header,
+            sync_start,
+            checkpoint,
             cancellation_token,
         }
     }
@@ -438,11 +442,8 @@ where
             self.finalizer_mailbox.clone(),
             self.buffer_mailbox.clone(),
             (resolver_rx, resolver),
-            self.sync_height,
-            self.sync_epoch,
-            self.sync_view,
-            self.checkpoint_last_block,
-            self.checkpoint_finalized_header,
+            self.sync_start,
+            self.checkpoint,
         );
         // start the orchestrator
         let orchestrator_handle =
